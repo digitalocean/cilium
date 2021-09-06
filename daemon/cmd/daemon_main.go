@@ -1553,6 +1553,10 @@ func runDaemon() {
 		link.DeleteByName(wireguardTypes.IfaceName)
 	}
 
+	dp := linuxdatapath.NewDatapath(datapathConfig, iptablesManager, wgAgent)
+	nodeHandler := dp.Node()
+	nodeHandler.NodeCleanNeighbors()
+
 	if k8s.IsEnabled() {
 		bootstrapStats.k8sInit.Start()
 		if err := k8s.Init(option.Config); err != nil {
@@ -1564,7 +1568,7 @@ func runDaemon() {
 	ctx, cancel := context.WithCancel(server.ServerCtx)
 	d, restoredEndpoints, err := NewDaemon(ctx, cancel,
 		WithDefaultEndpointManager(ctx, endpoint.CheckHealth),
-		linuxdatapath.NewDatapath(datapathConfig, iptablesManager, wgAgent))
+		dp)
 	if err != nil {
 		select {
 		case <-server.ServerCtx.Done():
