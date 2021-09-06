@@ -1401,6 +1401,11 @@ func runDaemon() {
 	iptablesManager := &iptables.IptablesManager{}
 	iptablesManager.Init()
 
+
+	dp := linuxdatapath.NewDatapath(datapathConfig, iptablesManager)
+	nodeHandler := dp.Node()
+	nodeHandler.NodeCleanNeighbors()
+
 	if k8s.IsEnabled() {
 		bootstrapStats.k8sInit.Start()
 		if err := k8s.Init(option.Config); err != nil {
@@ -1409,9 +1414,9 @@ func runDaemon() {
 		bootstrapStats.k8sInit.End(true)
 	}
 
-	d, restoredEndpoints, err := NewDaemon(server.ServerCtx,
-		WithDefaultEndpointManager(),
-		linuxdatapath.NewDatapath(datapathConfig, iptablesManager))
+	d, restoredEndpoints, err := NewDaemon(ctx, cancel,
+		WithDefaultEndpointManager(ctx, endpoint.CheckHealth),
+		dp)
 	if err != nil {
 		select {
 		case <-server.ServerCtx.Done():
