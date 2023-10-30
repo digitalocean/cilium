@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/errdefs"
 )
 
@@ -25,15 +26,14 @@ func (cli *Client) ImagePush(ctx context.Context, image string, options types.Im
 		return nil, errors.New("cannot push a digest reference")
 	}
 
-	tag := ""
 	name := reference.FamiliarName(ref)
-
-	if nameTaggedRef, isNamedTagged := ref.(reference.NamedTagged); isNamedTagged {
-		tag = nameTaggedRef.Tag()
-	}
-
 	query := url.Values{}
-	query.Set("tag", tag)
+	if !options.All {
+		ref = reference.TagNameOnly(ref)
+		if tagged, ok := ref.(reference.Tagged); ok {
+			query.Set("tag", tagged.Tag())
+		}
+	}
 
 	resp, err := cli.tryImagePush(ctx, name, query, options.RegistryAuth)
 	if errdefs.IsUnauthorized(err) && options.PrivilegeFunc != nil {
@@ -50,6 +50,6 @@ func (cli *Client) ImagePush(ctx context.Context, image string, options types.Im
 }
 
 func (cli *Client) tryImagePush(ctx context.Context, imageID string, query url.Values, registryAuth string) (serverResponse, error) {
-	headers := map[string][]string{"X-Registry-Auth": {registryAuth}}
+	headers := map[string][]string{registry.AuthHeader: {registryAuth}}
 	return cli.post(ctx, "/images/"+imageID+"/push", query, nil, headers)
 }
