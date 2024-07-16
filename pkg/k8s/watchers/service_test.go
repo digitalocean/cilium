@@ -7,104 +7,20 @@ import (
 	"sort"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/statedb"
+	"github.com/stretchr/testify/require"
 
-	agentK8s "github.com/cilium/cilium/daemon/k8s"
-	"github.com/cilium/cilium/pkg/checker"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	fakeDatapath "github.com/cilium/cilium/pkg/datapath/fake"
+	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
+	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/k8s"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/util/intstr"
-	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
-	"github.com/cilium/cilium/pkg/policy"
-	"github.com/cilium/cilium/pkg/policy/api"
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 )
-
-// Hook up gocheck into the "go test" runner.
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type K8sWatcherSuite struct{}
-
-var _ = Suite(&K8sWatcherSuite{})
-
-var emptyResources = agentK8s.Resources{}
-
-type fakeWatcherConfiguration struct{}
-
-func (f *fakeWatcherConfiguration) K8sServiceProxyNameValue() string {
-	return ""
-}
-
-func (f *fakeWatcherConfiguration) K8sEnvoyConfigEnabled() bool {
-	return false
-}
-
-func (f *fakeWatcherConfiguration) K8sIngressControllerEnabled() bool {
-	return false
-}
-
-func (f *fakeWatcherConfiguration) K8sGatewayAPIEnabled() bool {
-	return false
-}
-
-func (f *fakeWatcherConfiguration) K8sNetworkPolicyEnabled() bool {
-	return true
-}
-
-type fakePolicyManager struct {
-	OnTriggerPolicyUpdates func(force bool, reason string)
-	OnPolicyAdd            func(rules api.Rules, opts *policy.AddOptions) (newRev uint64, err error)
-	OnPolicyDelete         func(labels labels.LabelArray, opts *policy.DeleteOptions) (newRev uint64, err error)
-}
-
-func (f *fakePolicyManager) TriggerPolicyUpdates(force bool, reason string) {
-	if f.OnTriggerPolicyUpdates != nil {
-		f.OnTriggerPolicyUpdates(force, reason)
-		return
-	}
-	panic("OnTriggerPolicyUpdates(force bool, reason string) was called and is not set!")
-}
-
-func (f *fakePolicyManager) PolicyAdd(rules api.Rules, opts *policy.AddOptions) (newRev uint64, err error) {
-	if f.OnPolicyAdd != nil {
-		return f.OnPolicyAdd(rules, opts)
-	}
-	panic("OnPolicyAdd(api.Rules, *policy.AddOptions) (uint64, error) was called and is not set!")
-}
-
-func (f *fakePolicyManager) PolicyDelete(labels labels.LabelArray, opts *policy.DeleteOptions) (newRev uint64, err error) {
-	if f.OnPolicyDelete != nil {
-		return f.OnPolicyDelete(labels, opts)
-	}
-	panic("OnPolicyDelete(labels.LabelArray, *policy.DeleteOptions) (uint64, error) was called and is not set!")
-}
-
-type fakePolicyRepository struct {
-	OnGetSelectorCache func() *policy.SelectorCache
-	OnTranslateRules   func(translator policy.Translator) (*policy.TranslationResult, error)
-}
-
-func (f *fakePolicyRepository) GetSelectorCache() *policy.SelectorCache {
-	if f.OnGetSelectorCache != nil {
-		return f.OnGetSelectorCache()
-	}
-	panic("OnGetSelectorCache() (*policy.SelectorCache) was called and is not set!")
-}
-
-func (f *fakePolicyRepository) TranslateRules(translator policy.Translator) (*policy.TranslationResult, error) {
-	if f.OnTranslateRules != nil {
-		return f.OnTranslateRules(translator)
-	}
-	panic("OnTranslateRules(policy.Translator) (*policy.TranslationResult, error) was called and is not set!")
-}
 
 type fakeSvcManager struct {
 	OnDeleteService func(frontend loadbalancer.L3n4Addr) (bool, error)
@@ -129,119 +45,23 @@ func (f *fakeSvcManager) UpsertService(p *loadbalancer.SVC) (bool, loadbalancer.
 	panic("OnUpsertService() was called and is not set!")
 }
 
-func (f *fakeSvcManager) RegisterL7LBService(serviceName, resourceName loadbalancer.ServiceName, ports []string, proxyPort uint16) error {
-	return nil
+func newDB(t *testing.T) (*statedb.DB, statedb.Table[datapathTables.NodeAddress]) {
+	db := statedb.New()
+	nodeAddrs, err := datapathTables.NewNodeAddressTable()
+	require.NoError(t, err)
+	err = db.RegisterTable(nodeAddrs)
+	require.NoError(t, err)
+
+	txn := db.WriteTxn(nodeAddrs)
+	for _, addr := range datapathTables.TestAddresses {
+		nodeAddrs.Insert(txn, addr)
+	}
+	txn.Commit()
+
+	return db, nodeAddrs
 }
 
-func (f *fakeSvcManager) RegisterL7LBServiceBackendSync(serviceName, resourceName loadbalancer.ServiceName, ports []string) error {
-	return nil
-}
-
-func (f *fakeSvcManager) RemoveL7LBService(serviceName, resourceName loadbalancer.ServiceName) error {
-	return nil
-}
-
-func (s *K8sWatcherSuite) TestUpdateToServiceEndpointsGH9525(c *C) {
-	ep1stApply := &slim_corev1.Endpoints{
-		ObjectMeta: slim_metav1.ObjectMeta{
-			Name:      "foo",
-			Namespace: "bar",
-		},
-		Subsets: []slim_corev1.EndpointSubset{
-			{
-				Addresses: []slim_corev1.EndpointAddress{{IP: "10.0.0.2"}},
-				Ports: []slim_corev1.EndpointPort{
-					{
-						Name:     "http-test-svc",
-						Port:     8080,
-						Protocol: slim_corev1.ProtocolTCP,
-					},
-				},
-			},
-		},
-	}
-	ep2ndApply := ep1stApply.DeepCopy()
-	ep2ndApply.Subsets[0].Addresses = append(
-		ep2ndApply.Subsets[0].Addresses,
-		slim_corev1.EndpointAddress{IP: "10.0.0.3"},
-	)
-
-	policyManagerCalls := 0
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-			policyManagerCalls++
-		},
-	}
-	policyRepositoryCalls := 0
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			rt, ok := tr.(k8s.RuleTranslator)
-			c.Assert(ok, Equals, true)
-			switch policyRepositoryCalls {
-			case 0:
-				parsedEPs := k8s.ParseEndpoints(ep1stApply)
-				c.Assert(rt.NewEndpoint.Backends, checker.DeepEquals, parsedEPs.Backends)
-			case 1:
-				parsedEPs := k8s.ParseEndpoints(ep2ndApply)
-				c.Assert(rt.NewEndpoint.Backends, checker.DeepEquals, parsedEPs.Backends)
-			default:
-				c.Assert(policyRepositoryCalls, Not(Equals), 0, Commentf("policy repository was called more times than expected!"))
-			}
-			policyRepositoryCalls++
-
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		nil,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
-	swg := lock.NewStoppableWaitGroup()
-
-	k8sSvc := &slim_corev1.Service{
-		ObjectMeta: slim_metav1.ObjectMeta{
-			Name:      "foo",
-			Namespace: "bar",
-			Labels: map[string]string{
-				"foo": "bar",
-			},
-		},
-		Spec: slim_corev1.ServiceSpec{
-			ClusterIP: "127.0.0.1",
-			Type:      slim_corev1.ServiceTypeClusterIP,
-		},
-	}
-
-	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
-	// Running a 2nd update should also trigger a new policy update
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
-
-	swg.Stop()
-	swg.Wait()
-
-	c.Assert(policyRepositoryCalls, Equals, 2)
-	c.Assert(policyManagerCalls, Equals, 2)
-}
-
-func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
+func Test_addK8sSVCs_ClusterIP(t *testing.T) {
 	option.Config.LoadBalancerProtocolDifferentiation = true
 
 	k8sSvc := &slim_corev1.Service{
@@ -471,16 +291,6 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 	upsert2nd := map[string]loadbalancer.SVC{}
 	del1st := map[string]struct{}{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
 	svcManager := &fakeSvcManager{
@@ -508,6 +318,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 			return false, 0, nil
 		},
 		OnDeleteService: func(fe loadbalancer.L3n4Addr) (b bool, e error) {
+			// TODO: doc
 			if fe.Protocol == loadbalancer.ANY {
 				return true, nil
 			}
@@ -518,49 +329,38 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ClusterIP(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateService(k8sSvc, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
-	w.K8sSvcCache.DeleteService(k8sSvc, swg)
+	k8sSvcCache.DeleteService(k8sSvc, swg)
 
 	swg.Stop()
 	swg.Wait()
-	c.Assert(svcUpsertManagerCalls, Equals, len(upsert1stWanted)+len(upsert2ndWanted))
-	c.Assert(svcDeleteManagerCalls, Equals, len(del1stWanted))
 
-	c.Assert(upsert1st, checker.DeepEquals, upsert1stWanted)
-	c.Assert(upsert2nd, checker.DeepEquals, upsert2ndWanted)
-	c.Assert(del1st, checker.DeepEquals, del1stWanted)
+	require.Equal(t, len(upsert1stWanted)+len(upsert2ndWanted), svcUpsertManagerCalls)
+	require.Equal(t, len(del1stWanted), svcDeleteManagerCalls)
+
+	require.EqualValues(t, upsert1stWanted, upsert1st)
+	require.EqualValues(t, upsert2ndWanted, upsert2nd)
+	require.EqualValues(t, del1stWanted, del1st)
 }
 
-func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
+func TestChangeSVCPort(t *testing.T) {
 	k8sSvc := &slim_corev1.Service{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "foo",
@@ -645,16 +445,6 @@ func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
 
 	upserts := []loadbalancer.SVC{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls := 0
 
 	svcManager := &fakeSvcManager{
@@ -672,39 +462,27 @@ func (s *K8sWatcherSuite) TestChangeSVCPort(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
-	w.K8sSvcCache.UpdateService(k8sSvcChanged, swg)
+	k8sSvcCache.UpdateService(k8sSvc, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateService(k8sSvcChanged, swg)
 
 	swg.Stop()
 	swg.Wait()
-	c.Assert(svcUpsertManagerCalls, Equals, 2) // Add and Update events
-	c.Assert(upserts, checker.DeepEquals, upsertsWanted)
+	require.Equal(t, 2, svcUpsertManagerCalls) // Add and Update events
+	require.EqualValues(t, upsertsWanted, upserts)
 }
 
-func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
+func Test_addK8sSVCs_NodePort(t *testing.T) {
 	enableNodePortBak := option.Config.EnableNodePort
 	option.Config.EnableNodePort = true
 	option.Config.LoadBalancerProtocolDifferentiation = true
@@ -840,8 +618,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		},
 	}
 
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1113,16 +891,6 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 	upsert2nd := map[string]loadbalancer.SVC{}
 	del1st := map[string]struct{}{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
 	svcManager := &fakeSvcManager{
@@ -1150,6 +918,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 			return false, 0, nil
 		},
 		OnDeleteService: func(fe loadbalancer.L3n4Addr) (b bool, e error) {
+			// TODO: doc
 			if fe.Protocol == loadbalancer.ANY {
 				return true, nil
 			}
@@ -1160,49 +929,37 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_NodePort(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(k8sSvc, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateService(k8sSvc, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
-	w.K8sSvcCache.DeleteService(k8sSvc, swg)
+	k8sSvcCache.DeleteService(k8sSvc, swg)
 
 	swg.Stop()
 	swg.Wait()
-	c.Assert(svcUpsertManagerCalls, Equals, len(upsert1stWanted)+len(upsert2ndWanted))
-	c.Assert(svcDeleteManagerCalls, Equals, len(del1stWanted))
+	require.Equal(t, len(upsert1stWanted)+len(upsert2ndWanted), svcUpsertManagerCalls)
+	require.Equal(t, len(del1stWanted), svcDeleteManagerCalls)
 
-	c.Assert(upsert1st, checker.DeepEquals, upsert1stWanted)
-	c.Assert(upsert2nd, checker.DeepEquals, upsert2ndWanted)
-	c.Assert(del1st, checker.DeepEquals, del1stWanted)
+	require.EqualValues(t, upsert1stWanted, upsert1st)
+	require.EqualValues(t, upsert2ndWanted, upsert2nd)
+	require.EqualValues(t, del1stWanted, del1st)
 }
 
-func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
+func Test_addK8sSVCs_GH9576_1(t *testing.T) {
 	// Adding service without any endpoints and later on modifying the service,
 	// cilium should:
 	// 1) delete the non existing services from the datapath.
@@ -1294,8 +1051,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 
 	clusterIP1 := loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("172.0.20.1"), 80, loadbalancer.ScopeExternal, 0)
 	clusterIP2 := loadbalancer.NewL3n4AddrID(loadbalancer.TCP, cmtypes.MustParseAddrCluster("172.0.20.1"), 81, loadbalancer.ScopeExternal, 0)
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1433,16 +1190,6 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 	upsert2nd := map[string]loadbalancer.SVC{}
 	del1st := map[string]loadbalancer.L3n4Addr{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 	wantSvcUpsertManagerCalls := len(upsert1stWanted) + len(upsert2ndWanted)
 	wantSvcDeleteManagerCalls := len(del1stWanted)
@@ -1478,44 +1225,32 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_1(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(k8sSvc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateService(k8sSvc1stApply, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 
-	w.K8sSvcCache.UpdateService(k8sSvc2ndApply, swg)
+	k8sSvcCache.UpdateService(k8sSvc2ndApply, swg)
 
 	swg.Stop()
 	swg.Wait()
-	c.Assert(svcUpsertManagerCalls, Equals, wantSvcUpsertManagerCalls)
-	c.Assert(svcDeleteManagerCalls, Equals, wantSvcDeleteManagerCalls)
+	require.Equal(t, wantSvcUpsertManagerCalls, svcUpsertManagerCalls)
+	require.Equal(t, wantSvcDeleteManagerCalls, svcDeleteManagerCalls)
 
-	c.Assert(upsert1st, checker.DeepEquals, upsert1stWanted)
-	c.Assert(upsert2nd, checker.DeepEquals, upsert2ndWanted)
-	c.Assert(del1st, checker.DeepEquals, del1stWanted)
+	require.EqualValues(t, upsert1stWanted, upsert1st)
+	require.EqualValues(t, upsert2ndWanted, upsert2nd)
+	require.EqualValues(t, del1stWanted, del1st)
 }
 
-func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
+func Test_addK8sSVCs_GH9576_2(t *testing.T) {
 	// Adding service without any endpoints and later on modifying the service,
 	// cilium should:
 	// 1) delete the non existing endpoints from the datapath, i.e., updating
@@ -1601,8 +1336,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 
 	clusterIP1 := loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("172.0.20.1"), 80, loadbalancer.ScopeExternal, 0)
 	clusterIP2 := loadbalancer.NewL3n4AddrID(loadbalancer.TCP, cmtypes.MustParseAddrCluster("172.0.20.1"), 81, loadbalancer.ScopeExternal, 0)
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -1744,16 +1479,6 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 	upsert2nd := map[string]loadbalancer.SVC{}
 	del1st := map[string]loadbalancer.L3n4Addr{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 	wantSvcUpsertManagerCalls := len(upsert1stWanted) + len(upsert2ndWanted)
 	wantSvcDeleteManagerCalls := len(del1stWanted)
@@ -1789,44 +1514,32 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_GH9576_2(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(k8sSvc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateService(k8sSvc1stApply, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
 	swg.Stop()
 	swg.Wait()
 
-	c.Assert(svcUpsertManagerCalls, Equals, wantSvcUpsertManagerCalls)
-	c.Assert(svcDeleteManagerCalls, Equals, wantSvcDeleteManagerCalls)
+	require.Equal(t, wantSvcUpsertManagerCalls, svcUpsertManagerCalls)
+	require.Equal(t, wantSvcDeleteManagerCalls, svcDeleteManagerCalls)
 
-	c.Assert(upsert1st, checker.DeepEquals, upsert1stWanted)
-	c.Assert(upsert2nd, checker.DeepEquals, upsert2ndWanted)
-	c.Assert(del1st, checker.DeepEquals, del1stWanted)
+	require.EqualValues(t, upsert1stWanted, upsert1st)
+	require.EqualValues(t, upsert2ndWanted, upsert2nd)
+	require.EqualValues(t, del1stWanted, del1st)
 }
 
-func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
+func Test_addK8sSVCs_ExternalIPs(t *testing.T) {
 	enableNodePortBak := option.Config.EnableNodePort
 	option.Config.EnableNodePort = true
 	option.Config.LoadBalancerProtocolDifferentiation = true
@@ -2035,8 +1748,8 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		}
 	}
 
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
 
 	nodePortIPs1 := []*loadbalancer.L3n4AddrID{
 		loadbalancer.NewL3n4AddrID(loadbalancer.UDP, cmtypes.MustParseAddrCluster("0.0.0.0"), 18080, loadbalancer.ScopeExternal, 0),
@@ -2672,16 +2385,6 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 	del1st := map[string]struct{}{}
 	del2nd := map[string]struct{}{}
 
-	policyManager := &fakePolicyManager{
-		OnTriggerPolicyUpdates: func(force bool, reason string) {
-		},
-	}
-	policyRepository := &fakePolicyRepository{
-		OnTranslateRules: func(tr policy.Translator) (result *policy.TranslationResult, e error) {
-			return &policy.TranslationResult{NumToServicesRules: 1}, nil
-		},
-	}
-
 	svcUpsertManagerCalls, svcDeleteManagerCalls := 0, 0
 
 	svcManager := &fakeSvcManager{
@@ -2716,6 +2419,7 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 			return false, 0, nil
 		},
 		OnDeleteService: func(fe loadbalancer.L3n4Addr) (b bool, e error) {
+			// TODO: doc
 			if fe.Protocol == loadbalancer.ANY {
 				return true, nil
 			}
@@ -2733,48 +2437,36 @@ func (s *K8sWatcherSuite) Test_addK8sSVCs_ExternalIPs(c *C) {
 		},
 	}
 
-	dp := fakeDatapath.NewDatapath()
-	w := NewK8sWatcher(
-		nil,
-		nil,
-		nil,
-		policyManager,
-		policyRepository,
-		svcManager,
-		dp,
-		nil,
-		nil,
-		nil,
-		nil,
-		&fakeWatcherConfiguration{},
-		testipcache.NewMockIPCache(),
-		nil,
-		emptyResources,
-		k8s.NewServiceCache(dp.LocalNodeAddressing()),
-	)
-	go w.k8sServiceHandler()
+	db, nodeAddrs := newDB(t)
+	k8sSvcCache := k8s.NewServiceCache(db, nodeAddrs)
+	svcWatcher := &K8sServiceWatcher{
+		k8sSvcCache: k8sSvcCache,
+		svcManager:  svcManager,
+	}
+
+	go svcWatcher.k8sServiceHandler()
 	swg := lock.NewStoppableWaitGroup()
 
-	w.K8sSvcCache.UpdateService(svc1stApply, swg)
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
+	k8sSvcCache.UpdateService(svc1stApply, swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep1stApply), swg)
 	// Running a 2nd update should also trigger a new upsert service
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 	// Running a 3rd update should also not trigger anything because the
 	// endpoints are the same
-	w.K8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
+	k8sSvcCache.UpdateEndpoints(k8s.ParseEndpoints(ep2ndApply), swg)
 
-	w.K8sSvcCache.UpdateService(svc2ndApply, swg)
+	k8sSvcCache.UpdateService(svc2ndApply, swg)
 
-	w.K8sSvcCache.DeleteService(svc1stApply, swg)
+	k8sSvcCache.DeleteService(svc1stApply, swg)
 
 	swg.Stop()
 	swg.Wait()
-	c.Assert(svcUpsertManagerCalls, Equals, len(upsert1stWanted)+len(upsert2ndWanted)+len(upsert3rdWanted))
-	c.Assert(svcDeleteManagerCalls, Equals, len(del1stWanted)+len(del2ndWanted))
+	require.Equal(t, len(upsert1stWanted)+len(upsert2ndWanted)+len(upsert3rdWanted), svcUpsertManagerCalls)
+	require.Equal(t, len(del1stWanted)+len(del2ndWanted), svcDeleteManagerCalls)
 
-	c.Assert(upsert1st, checker.DeepEquals, upsert1stWanted)
-	c.Assert(upsert2nd, checker.DeepEquals, upsert2ndWanted)
-	c.Assert(upsert3rd, checker.DeepEquals, upsert3rdWanted)
-	c.Assert(del1st, checker.DeepEquals, del1stWanted)
-	c.Assert(del2nd, checker.DeepEquals, del2ndWanted)
+	require.EqualValues(t, upsert1stWanted, upsert1st)
+	require.EqualValues(t, upsert2ndWanted, upsert2nd)
+	require.EqualValues(t, upsert3rdWanted, upsert3rd)
+	require.EqualValues(t, del1stWanted, del1st)
+	require.EqualValues(t, del2ndWanted, del2nd)
 }
