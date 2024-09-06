@@ -325,13 +325,13 @@ func (s *K8sSuite) TestIsK8ServiceExternal(c *check.C) {
 func (s *K8sSuite) TestServiceUniquePorts(c *check.C) {
 	type testMatrix struct {
 		input    Service
-		expected map[uint16]bool
+		expected map[string]bool
 	}
 
 	matrix := []testMatrix{
 		{
 			input:    Service{},
-			expected: map[uint16]bool{},
+			expected: map[string]bool{},
 		},
 		{
 			input: Service{
@@ -346,10 +346,11 @@ func (s *K8sSuite) TestServiceUniquePorts(c *check.C) {
 					},
 				},
 			},
-			expected: map[uint16]bool{
-				1: true,
-				2: true,
-			}},
+			expected: map[string]bool{
+				"1/NONE": true,
+				"2/NONE": true,
+			},
+		},
 	}
 
 	for _, m := range matrix {
