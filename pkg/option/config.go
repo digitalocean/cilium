@@ -3537,6 +3537,8 @@ func (c *DaemonConfig) Populate(vp *viper.Viper) {
 
 	// To support K8s NetworkPolicy
 	c.EnableK8sNetworkPolicy = vp.GetBool(EnableK8sNetworkPolicy)
+
+	c.LoadBalancerProtocolDifferentiation = vp.GetBool(LoadBalancerProtocolDifferentiation)
 }
 
 func (c *DaemonConfig) populateDevices(vp *viper.Viper) {
@@ -3554,8 +3556,6 @@ func (c *DaemonConfig) populateDevices(vp *viper.Viper) {
 	for dev := range devSet {
 		c.devices = append(c.devices, dev)
 	}
-
-	c.LoadBalancerProtocolDifferentiation = vp.GetBool(LoadBalancerProtocolDifferentiation)
 }
 
 func (c *DaemonConfig) populateLoadBalancerSettings(vp *viper.Viper) {
