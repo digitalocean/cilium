@@ -324,7 +324,7 @@ static __always_inline int __sock4_xlate_fwd(struct bpf_sock_addr *ctx,
 	 * HostPort services.
 	 */
 	svc = lb4_lookup_service(&key, true, false);
-	if (!svc)
+	if (!svc) {
 		/* Restore the original key's protocol as lb4_lookup_service
 		 * has overwritten it.
 		 */
@@ -504,7 +504,7 @@ static __always_inline int __sock4_post_bind(struct bpf_sock *ctx,
 		return 0;
 
 	svc = lb4_lookup_service(&key, true, false);
-	if (!svc)
+	if (!svc) {
 		/* Perform a wildcard lookup for the case where the caller
 		 * tries to bind to loopback or an address with host identity
 		 * (without remote hosts).
@@ -616,7 +616,7 @@ static __always_inline int __sock4_xlate_rev(struct bpf_sock_addr *ctx,
 		};
 
 		svc = lb4_lookup_service(&svc_key, true, false);
-		if (!svc)
+		if (!svc) {
 			/* Restore the original key's protocol as lb4_lookup_service
 			 * has overwritten it.
 			 */
@@ -1040,7 +1040,7 @@ static __always_inline int __sock6_xlate_fwd(struct bpf_sock_addr *ctx,
 	memcpy(&orig_key, &key, sizeof(key));
 
 	svc = lb6_lookup_service(&key, true, false);
-	if (!svc)
+	if (!svc) {
 		/* Restore the original key's protocol as lb6_lookup_service
 		 * has overwritten it.
 		 */
@@ -1235,7 +1235,7 @@ static __always_inline int __sock6_xlate_rev(struct bpf_sock_addr *ctx)
 		};
 
 		svc = lb6_lookup_service(&svc_key, true, false);
-		if (!svc)
+		if (!svc) {
 			/* Restore the original key's protocol as lb6_lookup_service
 			 * has overwritten it.
 			 */
