@@ -718,53 +718,60 @@ func (k *K8sWatcher) delK8sSVCs(svc k8s.ServiceID, svcInfo *k8s.Service, se *k8s
 		logfields.K8sNamespace: svc.Namespace,
 	})
 
-	repPorts := svcInfo.UniquePorts()
-
-	frontends := []*loadbalancer.L3n4Addr{}
-
-	for portName, svcPort := range svcInfo.Ports {
-		if !repPorts[svcPort.Port] {
-			continue
-		}
-		repPorts[svcPort.Port] = false
-
-		for _, feIP := range svcInfo.FrontendIPs {
-			fe := loadbalancer.NewL3n4Addr(svcPort.Protocol, cmtypes.MustAddrClusterFromIP(feIP), svcPort.Port, loadbalancer.ScopeExternal)
-			frontends = append(frontends, fe)
+	for _, checkProtocol := range []bool{true, false} {
+		if !checkProtocol {
+			svcInfo = stripServiceProtocol(svcInfo)
 		}
 
-		for _, nodePortFE := range svcInfo.NodePorts[portName] {
-			frontends = append(frontends, &nodePortFE.L3n4Addr)
-			if svcInfo.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal || svcInfo.IntTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal {
-				cpFE := nodePortFE.L3n4Addr.DeepCopy()
-				cpFE.Scope = loadbalancer.ScopeInternal
-				frontends = append(frontends, cpFE)
+		repPorts := svcInfo.UniquePorts()
+
+		frontends := []*loadbalancer.L3n4Addr{}
+
+		for portName, svcPort := range svcInfo.Ports {
+			if !repPorts[svcPort.String()] {
+				continue
+			}
+			repPorts[svcPort.String()] = false
+
+			for _, feIP := range svcInfo.FrontendIPs {
+				fe := loadbalancer.NewL3n4Addr(svcPort.Protocol, cmtypes.MustAddrClusterFromIP(feIP), svcPort.Port, loadbalancer.ScopeExternal)
+				frontends = append(frontends, fe)
+			}
+
+			for _, nodePortFE := range svcInfo.NodePorts[portName] {
+				frontends = append(frontends, &nodePortFE.L3n4Addr)
+				if svcInfo.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal || svcInfo.IntTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal {
+					cpFE := nodePortFE.L3n4Addr.DeepCopy()
+					cpFE.Scope = loadbalancer.ScopeInternal
+					frontends = append(frontends, cpFE)
+				}
+			}
+
+			for _, k8sExternalIP := range svcInfo.K8sExternalIPs {
+				frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, cmtypes.MustAddrClusterFromIP(k8sExternalIP), svcPort.Port, loadbalancer.ScopeExternal))
+			}
+
+			for _, ip := range svcInfo.LoadBalancerIPs {
+				addrCluster := cmtypes.MustAddrClusterFromIP(ip)
+				frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, addrCluster, svcPort.Port, loadbalancer.ScopeExternal))
+				if svcInfo.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal || svcInfo.IntTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal {
+					frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, addrCluster, svcPort.Port, loadbalancer.ScopeInternal))
+				}
 			}
 		}
 
-		for _, k8sExternalIP := range svcInfo.K8sExternalIPs {
-			frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, cmtypes.MustAddrClusterFromIP(k8sExternalIP), svcPort.Port, loadbalancer.ScopeExternal))
-		}
-
-		for _, ip := range svcInfo.LoadBalancerIPs {
-			addrCluster := cmtypes.MustAddrClusterFromIP(ip)
-			frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, addrCluster, svcPort.Port, loadbalancer.ScopeExternal))
-			if svcInfo.ExtTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal || svcInfo.IntTrafficPolicy == loadbalancer.SVCTrafficPolicyLocal {
-				frontends = append(frontends, loadbalancer.NewL3n4Addr(svcPort.Protocol, addrCluster, svcPort.Port, loadbalancer.ScopeInternal))
+		for _, fe := range frontends {
+			if found, err := k.svcManager.DeleteService(*fe); err != nil {
+				scopedLog.WithError(err).WithField(logfields.Object, logfields.Repr(fe)).
+					Warn("Error deleting service by frontend")
+			} else if !found {
+				scopedLog.WithField(logfields.Object, logfields.Repr(fe)).Warn("service not found")
+			} else {
+				scopedLog.Debugf("# cilium lb delete-service %s %d 0", fe.AddrCluster.String(), fe.Port)
 			}
 		}
 	}
 
-	for _, fe := range frontends {
-		if found, err := k.svcManager.DeleteService(*fe); err != nil {
-			scopedLog.WithError(err).WithField(logfields.Object, logfields.Repr(fe)).
-				Warn("Error deleting service by frontend")
-		} else if !found {
-			scopedLog.WithField(logfields.Object, logfields.Repr(fe)).Warn("service not found")
-		} else {
-			scopedLog.Debugf("# cilium lb delete-service %s %d 0", fe.AddrCluster.String(), fe.Port)
-		}
-	}
 	return nil
 }
 
@@ -861,10 +868,10 @@ func datapathSVCs(svc *k8s.Service, endpoints *k8s.Endpoints) (svcs []loadbalanc
 
 	clusterIPPorts := map[loadbalancer.FEPortName]*loadbalancer.L4Addr{}
 	for fePortName, fePort := range svc.Ports {
-		if !uniqPorts[fePort.Port] {
+		if !uniqPorts[fePort.String()] {
 			continue
 		}
-		uniqPorts[fePort.Port] = false
+		uniqPorts[fePort.String()] = false
 		clusterIPPorts[fePortName] = fePort
 	}
 
@@ -925,6 +932,38 @@ func hashSVCMap(svcs []loadbalancer.SVC) map[string]loadbalancer.L3n4Addr {
 	return m
 }
 
+func stripServiceProtocol(svc *k8s.Service) *k8s.Service {
+	if svc == nil {
+		return nil
+	}
+
+	svc = svc.DeepCopy()
+
+	for _, port := range svc.Ports {
+		port.Protocol = "ANY"
+	}
+
+	for _, nodePort := range svc.NodePorts {
+		for _, port := range nodePort {
+			port.Protocol = "ANY"
+		}
+	}
+
+	return svc
+}
+
+func stripEndpointsProtocol(endpoints *k8s.Endpoints) *k8s.Endpoints {
+	endpoints = endpoints.DeepCopy()
+
+	for _, backend := range endpoints.Backends {
+		for _, port := range backend.Ports {
+			port.Protocol = "ANY"
+		}
+	}
+
+	return endpoints
+}
+
 func (k *K8sWatcher) addK8sSVCs(svcID k8s.ServiceID, oldSvc, svc *k8s.Service, endpoints *k8s.Endpoints) error {
 	// Headless services do not need any datapath implementation
 	if svc.IsHeadless {
@@ -935,6 +974,12 @@ func (k *K8sWatcher) addK8sSVCs(svcID k8s.ServiceID, oldSvc, svc *k8s.Service, e
 		logfields.K8sSvcName:   svcID.Name,
 		logfields.K8sNamespace: svcID.Namespace,
 	})
+
+	if !option.Config.LoadBalancerProtocolDifferentiation {
+		oldSvc = stripServiceProtocol(oldSvc)
+		svc = stripServiceProtocol(svc)
+		endpoints = stripEndpointsProtocol(endpoints)
+	}
 
 	svcs := datapathSVCs(svc, endpoints)
 	svcMap := hashSVCMap(svcs)
