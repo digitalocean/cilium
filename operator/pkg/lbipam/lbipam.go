@@ -125,6 +125,9 @@ func (ipam *LBIPAM) restart() {
 }
 
 func (ipam *LBIPAM) Run(ctx context.Context, health cell.Health) {
+	ipam.logger.Info("LB-IPAM is not initializing - disabled by DigitalOcean")
+	return
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
