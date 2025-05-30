@@ -42,7 +42,7 @@ func (lc lbipamConfig) Flags(flags *pflag.FlagSet) {
 }
 
 func (lc lbipamConfig) IsEnabled() bool {
-	return true
+	return false
 }
 
 type Config interface {
